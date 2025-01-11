@@ -4,17 +4,37 @@ import threading
 import os
 import argparse
 import math
-
+import time
+from tqdm import tqdm  # progress bar
 
 # Configuration
 TRACKER_URL = "http://127.0.0.1:8080"
 P2P_FOLDER = "p2p"
-CHUNK_SIZE = 1024  # 1 MB per chunk (anpassbar)
+CHUNK_SIZE = 1024  # 1 MB per chunk (adjustable)
+MAX_RETRIES = 3            # Maximum number of retries per chunk
+
+
+def recv_line(sock):
+    """
+    Receives a single line (delimited by b'\n') from the socket.
+    Returns the line (without '\n') as a string.
+    """
+    data = b""
+    while True:
+        chunk = sock.recv(1)
+        if not chunk:
+            break  # Connection closed
+        if chunk == b"\n":
+            break
+        data += chunk
+    return data.decode('utf-8')
 
 
 def handle_client_connection(conn, addr):
     """
-    Sends the entire file after sending 'OK <size>\n'.
+    Handles incoming connections to serve requested files.
+    Expects request: "REQUEST <filename>"
+    Returns: "OK <file_size>\n" followed by file content
     """
     try:
         data = conn.recv(1024).decode('utf-8').strip()
@@ -22,7 +42,6 @@ def handle_client_connection(conn, addr):
             conn.sendall("ERROR Invalid request.\n".encode('utf-8'))
             return
 
-        # "REQUEST filename"
         _, filename = data.split(" ", 1)
         file_path = os.path.join(P2P_FOLDER, filename)
 
@@ -30,8 +49,8 @@ def handle_client_connection(conn, addr):
             conn.sendall("NOTFOUND\n".encode('utf-8'))
             return
 
+        # Send file size
         file_size = os.path.getsize(file_path)
-        # Send header
         header = f"OK {file_size}\n"
         conn.sendall(header.encode('utf-8'))
 
@@ -47,56 +66,6 @@ def handle_client_connection(conn, addr):
         print(f"[Server] Error handling request from {addr}: {e}")
     finally:
         conn.close()
-
-def recv_line(sock):
-    """
-    Receives a single line (delimited by b'\n') from the socket.
-    Returns the line (ohne '\n') als str.
-    """
-    data = b""
-    while True:
-        chunk = sock.recv(1)
-        if not chunk:
-            break  # connection closed
-        if chunk == b"\n":
-            break
-        data += chunk
-    return data.decode('utf-8')
-
-
-def request_file_size(peer, filename):
-    """
-    Connect to 'peer', request the file.
-    Parse the first line: 'OK <size>' or 'NOTFOUND'.
-    Returns the file size (int) or None if not found.
-    Does NOT download the file data here (just reads the first line).
-    """
-    host, port = peer.split(":")
-    port = int(port)
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(5)
-            s.connect((host, port))
-            s.sendall(f"REQUEST {filename}\n".encode('utf-8'))
-
-            # Read exactly one line
-            line = recv_line(s).strip()
-            if not line:
-                return None
-            if line.startswith("NOTFOUND"):
-                return None
-            if not line.startswith("OK "):
-                return None
-            # "OK 12345" => size = 12345
-            size_str = line.split(" ", 1)[1]
-            try:
-                file_size = int(size_str)
-            except ValueError:
-                return None
-
-            return file_size
-    except:
-        return None
 
 
 def server_thread(port):
@@ -132,6 +101,17 @@ def register_with_tracker(peer_address):
         print(f"[Tracker] Error contacting tracker: {e}")
         return []
 
+def get_available_peers_for_file(peers, filename):
+    """
+    Check which peers have the specified file.
+    Returns a list of peers that have the file.
+    """
+    available_peers = []
+    for peer in peers:
+        if request_file_size(peer, filename) is not None:
+            available_peers.append(peer)
+    return available_peers
+
 
 def get_peers_from_tracker():
     """
@@ -141,6 +121,7 @@ def get_peers_from_tracker():
         response = requests.get(f"{TRACKER_URL}/get_peers")
         if response.status_code == 200:
             peers = response.json().get("peers", [])
+            print(f"[Tracker] Current peers: {peers}")
             return peers
         else:
             print("[Tracker] Failed to get peers from the tracker.")
@@ -153,59 +134,67 @@ def get_peers_from_tracker():
 def request_file_size(peer, filename):
     """
     Connects to 'peer' and requests the size of 'filename'.
-    Returns the file size (int) or None if not found/error.
+    Returns the file size (int) or None if not found.
     """
     try:
         host, port = peer.split(":")
         port = int(port)
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(2)
+            s.settimeout(5)
             s.connect((host, port))
             req = f"REQUEST {filename}\n"
             s.sendall(req.encode('utf-8'))
 
-            header = s.recv(1024).decode('utf-8').strip()
-            if header.startswith("NOTFOUND"):
+            # Read exactly one line
+            line = recv_line(s).strip()
+            if not line:
                 return None
-            if not header.startswith("OK "):
+            if line.startswith("NOTFOUND"):
                 return None
-            file_size = int(header.split(" ")[1])
+            if not line.startswith("OK "):
+                return None
+            # "OK 12345" => size = 12345
+            size_str = line.split(" ", 1)[1]
+            try:
+                file_size = int(size_str)
+            except ValueError:
+                return None
+
             return file_size
     except:
         return None
 
 
-def download_chunk_to_file(peer, filename, start, end, chunk_index, chunks_dir):
+def download_chunk_to_file(peer, filename, start, end, chunk_index, chunks_dir, lock, failed_chunks):
     """
-    Downloads the ENTIRE file from 'peer', but only keeps [start:end).
-    Saves it to:  <chunks_dir>/<chunk_index>.part
-    Returns True on success, False on error.
+    Downloads a chunk from 'peer' and saves it to a temporary file.
+    If the download fails, it adds the chunk index to 'failed_chunks'.
     """
     host, port = peer.split(":")
     port = int(port)
-    print(f"[Client] Downloading chunk {chunk_index} [{start}:{end}] from peer {peer}...")
+
+    #print(f"[Client] Attempting to download chunk {chunk_index} [{start}:{end}] from {peer}...")
+
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(5)
             s.connect((host, port))
-
-            # Request the file
             s.sendall(f"REQUEST {filename}\n".encode('utf-8'))
 
-            # 1) Read header line
-            line = recv_line(s).strip()  # e.g. "OK 262144"
+            # Read header line
+            line = recv_line(s).strip()
             if not line or line.startswith("NOTFOUND"):
-                print(f"[Client] Peer {peer} does not have {filename}.")
-                return False
+                tqdm.write(f"[Client] Peer {peer} does not have {filename}.")
+                raise Exception("File not found on peer.")
             if not line.startswith("OK "):
-                print(f"[Client] Unexpected header from {peer}: {line}")
-                return False
+                tqdm.write(f"[Client] Unexpected header from {peer}: {line}")
+                raise Exception("Unexpected header.")
 
-            # parse file size
+            # Parse file size
             size_str = line.split(" ", 1)[1]
             total_size = int(size_str)
 
-            # We'll download the entire file into memory (be careful if it's big!)
+            # Download entire file
             file_data = b""
             received = 0
             while received < total_size:
@@ -216,14 +205,11 @@ def download_chunk_to_file(peer, filename, start, end, chunk_index, chunks_dir):
                 received += len(chunk)
 
             if len(file_data) < total_size:
-                print(f"[Client] Connection closed early from {peer}")
-                return False
+                raise Exception("Incomplete file received.")
 
-            # Now slice out [start:end)
-            # If start/end are out of range, clamp them
+            # Extract the relevant chunk data
             if start >= len(file_data):
-                # This chunk is beyond EOF, produce empty file
-                chunk_data = b""
+                chunk_data = b""  # Chunk is beyond EOF
             else:
                 chunk_data = file_data[start:end]
 
@@ -232,73 +218,113 @@ def download_chunk_to_file(peer, filename, start, end, chunk_index, chunks_dir):
             with open(out_path, 'wb') as f:
                 f.write(chunk_data)
 
+        #print(f"[Client] Successfully downloaded chunk {chunk_index} from {peer}.")
         return True
+
     except Exception as e:
-        print(f"[Client] Error downloading chunk [{start}:{end}] from {peer}: {e}")
+        tqdm.write(f"[Client] Error downloading chunk {chunk_index} from {peer}: {e}")
+        with lock:
+            failed_chunks.append(chunk_index)
         return False
+
 
 
 def parallel_download(filename, peers):
     """
-    1) Bestimme file_size über 'request_file_size' bei einem beliebigen Peer.
-    2) Erzeuge einen Ordner "filename_chunks" für die .part-Dateien.
-    3) Starte Threads: Jeder Thread lädt [start, end) in eine .part-Datei.
-    4) Warte auf Fertigstellung.
-    5) Füge alle .part-Dateien zusammen und lösche sie.
+    Downloads the file in parallel from available peers.
+    Failed chunks are retried with other peers.
     """
     if not peers:
-        print("[Client] No peers available for parallel download.")
+        tqdm.write("[Client] No peers available for download.")
         return
 
-    # 1) Determine file size
-    file_size = None
-    for p in peers:
-        fs = request_file_size(p, filename)
-        if fs is not None and fs > 0:
-            file_size = fs
-            break
+    # 1. Check which peers have the file
+    available_peers = get_available_peers_for_file(peers, filename)
+    if not available_peers:
+        tqdm.write(f"[Client] No peers have the file '{filename}'.")
+        return
 
+    # 2. Determine file size from the first available peer
+    file_size = request_file_size(available_peers[0], filename)
     if file_size is None:
-        print(f"[Client] Could not find '{filename}' on any peer.")
+        tqdm.write(f"[Client] Could not determine file size for '{filename}'.")
         return
 
-    print(f"[Client] File size of '{filename}' is {file_size} bytes.")
+    tqdm.write(f"[Client] File size of '{filename}' is {file_size} bytes.")
 
-    # 2) Create chunk directory
+    # 3. Create chunk directory
     chunk_dir = os.path.join(P2P_FOLDER, f"{filename}_chunks")
     if not os.path.exists(chunk_dir):
         os.makedirs(chunk_dir)
 
-    # 3) Calculate number of chunks
-    #    We'll use e.g. CHUNK_SIZE = 4 KB or 1 MB, je nachdem
+    # 4. Calculate number of chunks
     total_chunks = math.ceil(file_size / CHUNK_SIZE)
-    print(f"[Client] Downloading in {total_chunks} chunks...")
+    tqdm.write(f"[Client] Downloading in {total_chunks} chunks...")
 
-    # We'll keep a list of threads
+    # 5. Thread-safe list for failed chunks
+    failed_chunks = []
+    lock = threading.Lock()
+
+    # 6. Create Progress-Bar
+    progress_bar = tqdm(total=total_chunks, desc=f"Downloading {filename}", unit="chunk")
+
+    # 7. Download chunks in parallel
+    def thread_download(chunk_index, assigned_peer):
+        start = chunk_index * CHUNK_SIZE
+        end = min(start + CHUNK_SIZE, file_size)
+        success = download_chunk_to_file(assigned_peer, filename, start, end, chunk_index, chunk_dir, lock, failed_chunks)
+        if success:
+            progress_bar.update(1)  # Update progress bar for successful download
+
     threads = []
-    num_peers = len(peers)
+    num_peers = len(available_peers)
 
     for i in range(total_chunks):
-        start = i * CHUNK_SIZE
-        end = min(start + CHUNK_SIZE, file_size)
-        assigned_peer = peers[i % num_peers]  # round-robin
-
-        t = threading.Thread(
-            target=download_chunk_to_file, 
-            args=(assigned_peer, filename, start, end, i, chunk_dir),
-            daemon=True
-        )
+        assigned_peer = available_peers[i % num_peers]  # Round-robin
+        t = threading.Thread(target=thread_download, args=(i, assigned_peer), daemon=True)
         threads.append(t)
 
-    # Start all threads
+    # Start threads
     for t in threads:
         t.start()
 
-    # Wait for all to finish
+    # Wait for all threads to finish
     for t in threads:
         t.join()
 
-    # 4) Combine all .part files
+    # 8. Retry failed chunks
+    retry_attempts = 3
+    for attempt in range(retry_attempts):
+        if not failed_chunks:
+            break  # All chunks downloaded
+        tqdm.write(f"[Client] Retrying {len(failed_chunks)} failed chunks (Attempt {attempt + 1}/{retry_attempts})...")
+
+        retry_threads = []
+        for chunk_index in failed_chunks[:]:
+            assigned_peer = available_peers[(chunk_index + attempt) % num_peers]
+
+            t = threading.Thread(
+                target=thread_download,
+                args=(chunk_index, assigned_peer),
+                daemon=True
+            )
+            retry_threads.append(t)
+
+        # Start retry threads
+        for t in retry_threads:
+            t.start()
+
+        # Wait for all retry threads
+        for t in retry_threads:
+            t.join()
+
+    progress_bar.close()  # Close the progress bar when done
+
+    if failed_chunks:
+        tqdm.write(f"[Client] Download incomplete. Missing chunks: {failed_chunks}")
+        return
+
+    # 9. Combine chunks into a single file
     local_path = os.path.join(P2P_FOLDER, filename)
     with open(local_path, 'wb') as out_f:
         for i in range(total_chunks):
@@ -306,18 +332,15 @@ def parallel_download(filename, peers):
             if os.path.exists(part_path):
                 with open(part_path, 'rb') as p_f:
                     out_f.write(p_f.read())
-                # Optional: remove the chunk file
                 os.remove(part_path)
 
-    # Optional: remove the chunk_dir if it's empty
+    # Clean up chunk directory
     try:
         os.rmdir(chunk_dir)
     except OSError:
         pass
 
-    print(f"[Client] Completed parallel download of '{filename}'. File is in '{local_path}'.")
-
-
+    #print(f"[Client] Successfully downloaded '{filename}' to '{local_path}'.")
 
 def main():
     parser = argparse.ArgumentParser(description="P2P Client with Tracker (Parallel Downloads)")
@@ -329,7 +352,7 @@ def main():
     if not os.path.exists(P2P_FOLDER):
         os.makedirs(P2P_FOLDER)
 
-    # Start server (Seeder) thread
+    # Start server thread (Seeder)
     t_server = threading.Thread(target=server_thread, args=(port,), daemon=True)
     t_server.start()
 
@@ -337,12 +360,12 @@ def main():
     my_address = f"127.0.0.1:{port}"
     peers = register_with_tracker(my_address)
 
-    # CLI
+    # Command-line interface for the client
     print("[CLI] Commands:")
     print("  LIST                  -> List all known peers")
-    print("  GET <filename>        -> Download file from all known peers (in parallel)")
-    print("  PEERS                 -> List all known peers (excluding self)")
+    print("  PEERS                 -> Refresh and list all known peers (excluding self)")
     print("  FILES                 -> List files in p2p folder")
+    print("  GET <filename>        -> Download file from peers in parallel")
     print("  EXIT                  -> Exit the program")
 
     while True:
@@ -369,10 +392,13 @@ def main():
 
             elif cmd == "GET" and len(cmd_parts) == 2:
                 filename = cmd_parts[1]
-                # Always refresh peer list before download
+                # Refresh peer list before download
                 peers = get_peers_from_tracker()
                 # Exclude self
                 active_peers = [p for p in peers if p != my_address]
+                if not active_peers:
+                    print("[Client] No other peers available.")
+                    continue
                 parallel_download(filename, active_peers)
 
             elif cmd == "EXIT":
@@ -382,6 +408,7 @@ def main():
             else:
                 print("[CLI] Unknown command.")
         except KeyboardInterrupt:
+            print("\n[CLI] Exiting...")
             break
         except Exception as e:
             print(f"[CLI] Error: {e}")
