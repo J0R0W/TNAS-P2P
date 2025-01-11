@@ -6,8 +6,6 @@ A simple Peer-to-Peer (P2P) file sharing application written in Python. The appl
 
 - **File Discovery**: Automatically queries peers to check who has a requested file.
 - **Parallel Downloads**: Downloads file chunks in parallel from multiple peers.
-- **Retry Mechanism**: Retries failed chunk downloads from alternate peers.
-- **Progress Bar**: Displays a live progress bar during downloads.
 - **File Chunking**: Downloads files in chunks and reassembles them upon completion.
 - **Tracker Integration**: Tracks and manages active peers for efficient file sharing.
 
@@ -15,8 +13,8 @@ A simple Peer-to-Peer (P2P) file sharing application written in Python. The appl
 
 1. Clone the repository:
    ```bash
-   git clone <repository-url>
-   cd <repository-folder>
+   git clone https://github.com/J0R0W/TNAS-P2P
+   cd TNAS-P2P
    ```
 
 2. Install the required dependencies:
