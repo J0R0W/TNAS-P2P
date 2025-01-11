@@ -57,25 +57,6 @@ To share files, place them in the `p2p` folder within the peer's directory. Thes
    - Download the file in chunks from the available peers.
    - Retry failed chunk downloads from other peers if necessary.
 
-### Other Commands
-
-- **List Known Peers**:
-  ```bash
-  > LIST
-  ```
-  Displays a list of all known peers.
-
-- **List Local Files**:
-  ```bash
-  > FILES
-  ```
-  Displays a list of files available in the peer's `p2p` folder.
-
-- **Exit the Application**:
-  ```bash
-  > EXIT
-  ```
-
 ## Example Workflow
 
 1. Start the tracker:
