@@ -13,8 +13,7 @@ A simple Peer-to-Peer (P2P) file sharing application written in Python. The appl
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/J0R0W/TNAS-P2P
-   cd TNAS-P2P
+   git clone https://github.com/J0R0W/TNAS-P2P   cd TNAS-P2P
    ```
 
 2. Install the required dependencies:
@@ -71,7 +70,7 @@ To share files, place them in the `p2p` folder within the peer's directory. Thes
 
 3. Start Peer 2 on port 5001:
    ```bash
-   python client.py --port 5001
+   python p2p_app.py --port 5001
    ```
 
 4. From Peer 2, request a file available in Peer 1's `p2p` folder:
